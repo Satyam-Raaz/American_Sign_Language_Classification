@@ -1,153 +1,109 @@
-# Import necessary libraries and functions
-from function import *
-from keras.utils import to_categorical
-from keras.models import model_from_json
-from keras.layers import LSTM, Dense
-from keras.callbacks import TensorBoard
+from collections import Counter, deque
 
-# Load the pre-trained model from JSON and weights from H5 file
-json_file = open("model.json", "r")
-model_json = json_file.read()
-json_file.close()
-model = model_from_json(model_json)
-model.load_weights("model.h5")
+import cv2
+import numpy as np
 
-# Define a list of colors (RGB format) for visualization
-colors = []
+from function import (
+    actions,
+    build_model,
+    draw_styled_landmarks,
+    get_hand_bbox,
+    load_weights_h5py,
+    mediapipe_detection,
+    mp_hands,
+    preprocess_image,
+)
 
-# Generate 20 colors and add them to the list
-for i in range(0, 20):
-    # Each color is represented as a tuple (R, G, B)
-    # where R, G, and B are the red, green, and blue channel values respectively
-    # Here, we're creating an orange-ish color with high red intensity (245),
-    # moderate green intensity (117), and low blue intensity (16).
-    colors.append((245, 117, 16))
-
-# Print the length of the colors list (should be 20)
-print(len(colors))
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+MODEL_H5 = "model.h5"
+THRESHOLD = 0.80      # minimum average confidence to accept a prediction
+WINDOW = 10           # number of recent frames used for smoothing
+MIN_VOTES = 7         # frames (out of WINDOW) that must agree
+FLIP_FRAME = False    # set True if your predictions look mirrored/wrong
+CAMERA_INDEX = 0      # or an IP camera URL, e.g. "http://192.168.1.5:8080/video"
 
 
-# Define a function for visualizing probabilities on the output frame
-def prob_viz(res, actions, input_frame, colors, threshold):
-    output_frame = input_frame.copy()
-    
-    # Loop through the probabilities and corresponding actions
-    for num, prob in enumerate(res):
-        # Calculate positions for drawing the rectangle and text
-        # Rectangle dimensions: (x1, y1) to (x2, y2)
-        x1 = 0  # Starting x-coordinate for the rectangle
-        y1 = 60 + num * 40  # Starting y-coordinate for the rectangle (spacing between rectangles)
-        x2 = int(prob * 100)  # Ending x-coordinate based on probability (scaled to 100% width)
-        y2 = 90 + num * 40  # Ending y-coordinate for the rectangle (spacing + rectangle height)
-        
-        # Draw a colored rectangle representing the probability
-        cv2.rectangle(output_frame, (x1, y1), (x2, y2), colors[num], -1)
-        
-        # Put the action label and probability on the frame
-        # Action label position: (text_x, text_y)
-        text_x = 0  # x-coordinate for the text label
-        text_y = 85 + num * 40  # y-coordinate for the text label (spacing + text baseline)
-        
-        # Configure the text appearance
-        cv2.putText(output_frame, actions[num], (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2,
-                    cv2.LINE_AA)
-    
-    # Return the output frame with visualized probabilities
-    return output_frame
+# ---------------------------------------------------------------------------
+# Load the model
+# ---------------------------------------------------------------------------
+def load_sign_model():
+    # The architecture is rebuilt in code (function.build_model), so the saved
+    # model config -- the part that breaks across Keras versions -- is never read.
+    model = build_model()
+    try:
+        model.load_weights(MODEL_H5)
+    except Exception as e:
+        print(f"model.load_weights failed ({str(e).strip().splitlines()[-1][:100]})")
+        print("Reading the weights directly from model.h5 with h5py...")
+        load_weights_h5py(model, MODEL_H5)
+    return model
 
 
-# Initialize variables for gesture recognition
-sequence = []
-sentence = []
-accuracy = []
-predictions = []
-threshold = 0.8  # Set a threshold for gesture recognition confidence
+model = load_sign_model()
+print("Model input shape :", model.input_shape)    # expect (None, 200, 200, 3)
+print("Model output shape:", model.output_shape)   # expect (None, 36)
 
-# Open a video capture stream (0 represents the default camera)
-cap = cv2.VideoCapture(0)
-# You can also use an IP camera by providing a URL like:
-# cap = cv2.VideoCapture("https://192.168.43.41:8080/video")
+# ---------------------------------------------------------------------------
+# Real-time recognition
+# ---------------------------------------------------------------------------
+recent = deque(maxlen=WINDOW)   # (class_index, probabilities) for recent frames
+current_text = ""
+current_conf = 0.0
 
-# Set up the MediaPipe Hands model with specific parameters
+cap = cv2.VideoCapture(CAMERA_INDEX)
+
 with mp_hands.Hands(
-    model_complexity=0,  # Model complexity (0 for the fastest model)
-    min_detection_confidence=0.5,  # Minimum confidence for hand detection
-    min_tracking_confidence=0.5  # Minimum confidence for hand tracking
+    model_complexity=0,
+    max_num_hands=1,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
 ) as hands:
     while cap.isOpened():
-        # Read a frame from the video capture
         ret, frame = cap.read()
+        if not ret:
+            break
+        if FLIP_FRAME:
+            frame = cv2.flip(frame, 1)
 
-        # Crop the frame to a specific region of interest
-        # Crop dimensions: Height (360 pixels) x Width (300 pixels)
-        cropframe = frame[40:400, 0:300]
+        # 1) Find the hand with MediaPipe
+        _, results = mediapipe_detection(frame, hands)
+        bbox = get_hand_bbox(results, frame.shape)
 
-        # Draw a rectangle on the frame to highlight the region of interest
-        # Rectangle coordinates: (x1, y1) to (x2, y2)
-        frame = cv2.rectangle(frame, (0, 40), (300, 400), 255, 2)
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            crop = frame[y1:y2, x1:x2]
 
-        # Perform hand detection and tracking using MediaPipe
-        image, results = mediapipe_detection(cropframe, hands)
+            if crop.size > 0:
+                # 2) Classify the cropped hand with the CNN
+                probs = model.predict(preprocess_image(crop), verbose=0)[0]
+                recent.append((int(np.argmax(probs)), probs))
 
-        # Extract keypoints from the hand landmarks
-        keypoints = extract_keypoints(results)
-        sequence.append(keypoints)
-        sequence = sequence[-30:]  # Keep only the last 30 frames for sequence input
+                # 3) Smooth over the last few frames to avoid flicker
+                if len(recent) == WINDOW:
+                    votes = Counter(idx for idx, _ in recent)
+                    best_idx, count = votes.most_common(1)[0]
+                    avg_conf = float(np.mean([p[best_idx] for _, p in recent]))
+                    if count >= MIN_VOTES and avg_conf >= THRESHOLD:
+                        current_text = str(actions[best_idx]).upper()
+                        current_conf = avg_conf * 100
 
-        try:
-            # Check if enough frames are collected for prediction
-            if len(sequence) == 30:
-                # Make a prediction using the loaded model
-                res = model.predict(np.expand_dims(sequence, axis=0))[0]
-                print(actions[np.argmax(res)])  # Print the recognized action
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            draw_styled_landmarks(frame, results)
+        else:
+            recent.clear()
+            current_text, current_conf = "", 0.0
 
-                # Store the prediction in the predictions list
-                predictions.append(np.argmax(res))
+        # 4) Draw the output bar
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 40), (245, 117, 16), -1)
+        label = f"Output: {current_text}  {current_conf:.1f}%" if current_text else "Output: -"
+        cv2.putText(frame, label, (3, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (255, 255, 255), 2, cv2.LINE_AA)
 
-                # Check if the predicted gesture has been consistent for the last 10 frames
-                if np.unique(predictions[-10:])[0] == np.argmax(res):
-                    if res[np.argmax(res)] > threshold:
-                        if len(sentence) > 0:
-                            # Append the recognized action to the sentence if it's different from the previous one
-                            if actions[np.argmax(res)] != sentence[-1]:
-                                sentence.append(actions[np.argmax(res)])
-                                accuracy.append(str(res[np.argmax(res)] * 100))
-                        else:
-                            sentence.append(actions[np.argmax(res)])
-                            accuracy.append(str(res[np.argmax(res)] * 100))
-
-                # Keep only the most recent action and accuracy values
-                if len(sentence) > 1:
-                    sentence = sentence[-1:]
-                    accuracy = accuracy[-1:]
-
-        except Exception as e:
-            # Handle exceptions (e.g., if prediction fails)
-            pass
-
-        # Draw a colored rectangle for displaying the output sentence and accuracy
-        # Rectangle coordinates: (x1, y1) to (x2, y2)
-        # Draw a filled orange-colored rectangle at the top of the 'frame'.
-        # The rectangle starts at (0, 0) as its top-left corner and ends at (300, 40).
-        # It serves as a background for displaying output text.
-
-        cv2.rectangle(frame, (0, 0), (300, 40), (245, 117, 16), -1)
-
-        # Put the output text on the 'frame'.
-        # The text "Output: -" followed by the 'sentence' and 'accuracy' content is displayed.
-        # The text is positioned at (3, 30) on the frame.
-
-        cv2.putText(frame, "Output: -" + ' '.join(sentence) + ''.join(accuracy), (3, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-
-        # Show the processed frame on the screen
-        cv2.imshow('OpenCV Feed', frame)
-
-        # Check for the 'q' key press to exit the loop
-        if cv2.waitKey(10) & 0xFF == ord('q'):
+        cv2.imshow("OpenCV Feed", frame)
+        if cv2.waitKey(10) & 0xFF == ord("q"):
             break
 
-    # Release the video capture and close all OpenCV windows
-    cap.release()
-    cv2.destroyAllWindows()
+cap.release()
+cv2.destroyAllWindows()
