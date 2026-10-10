@@ -1,0 +1,67 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+*.manifest
+*.spec
+
+# ===== Virtual Environments =====
+myenv/
+venv/
+env/
+ENV/
+.venv/
+dataset/
+
+# ===== Environment / Secrets =====
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+model.h5
+# ===== Chroma / Vector DB =====
+chroma_db/
+chroma_db_test/
+*.sqlite3
+*.sqlite3-journal
+
+# ===== Uploaded / Generated Files =====
+uploads/
+outputs/
+*.pdf
+*.docx
+*.csv
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== HuggingFace / Model cache =====
+.cache/
+*.bin
+*.onnx
+
+# ===== Misc =====
+*.tmp
+*.bak
